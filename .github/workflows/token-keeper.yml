@@ -1,0 +1,53 @@
+name: token-keeper
+
+# 인스타 토큰 관리 — 매주 월요일 09:00 KST
+#  1) 토큰이 살아 있는지 확인 → 죽었으면 실패 → GitHub 가 메일로 알림
+#  2) IGAA 토큰(60일)이고 Secret GH_PAT 가 있으면 연장해 IG_ACCESS_TOKEN 을 자동 교체 → 만료되지 않음
+#     EAA 토큰(시스템 사용자)은 만료가 없어 연장하지 않는다
+#     GH_PAT = Fine-grained PAT · 이 저장소 1개 · "Secrets: Read and write"
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: |
+          case "$IG_ACCESS_TOKEN" in
+            EAA*) kind=EAA; url="https://graph.facebook.com/v21.0/${IG_USER_ID}?fields=username" ;;
+            *)    kind=IGAA; url="https://graph.instagram.com/me?fields=user_id,username" ;;
+          esac
+          res=$(curl -s "${url}&access_token=${IG_ACCESS_TOKEN}")
+          if echo "$res" | grep -q '"error"'; then
+            echo "::error::인스타 토큰($kind)이 만료됐거나 틀렸습니다. 토큰을 다시 받아 IG_ACCESS_TOKEN 을 교체하세요."
+            echo "$res" | sed 's/"access_token":"[^"]*"/"access_token":"***"/'
+            exit 1
+          fi
+          echo "✅ 토큰 정상($kind) — $(echo "$res" | grep -o '"username":"[^"]*"')"
+
+      - name: Refresh token (IGAA + GH_PAT 가 있을 때만)
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          case "$IG_ACCESS_TOKEN" in EAA*) echo "EAA 토큰은 만료가 없어 연장하지 않습니다."; exit 0 ;; esac
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_PAT 없음 — 자동 연장은 건너뜁니다. 50일마다 수동 연장을 하세요."
+            exit 0
+          fi
+          res=$(curl -s "https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${IG_ACCESS_TOKEN}")
+          new=$(echo "$res" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))')
+          if [ -z "$new" ]; then
+            echo "::warning::연장 실패(발급 24시간 이내일 수 있음). 다음 주에 다시 시도합니다."
+            exit 0
+          fi
+          echo "::add-mask::$new"
+          gh secret set IG_ACCESS_TOKEN --body "$new" --repo "$GITHUB_REPOSITORY"
+          echo "✅ 토큰 연장 · Secret 교체 완료 (앞으로 약 60일 유효)"
